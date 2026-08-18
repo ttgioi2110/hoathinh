@@ -413,18 +413,31 @@ export async function resolveEpisode(bases, slug, episode) {
     const src = abs(base, $(el).attr('src'));
     if (src) scanTextForUrls(src, direct);
   });
-  if (direct.size) return { pageUrl: resolvedPageUrl, sources: [...direct.values()] };
+  const mergeSources = (...groups) => {
+    const merged = new Map();
+    for (const group of groups) {
+      for (const source of group || []) {
+        if (source?.url) merged.set(source.url, { ...merged.get(source.url), ...source });
+      }
+    }
+    return [...merged.values()];
+  };
+  const directSources = [...direct.values()];
 
-  if (!BROWSER_ENABLED) return { pageUrl: resolvedPageUrl, sources: [] };
+  if (!BROWSER_ENABLED) return { pageUrl: resolvedPageUrl, sources: directSources };
   try {
-    const cached = cache.get(`resolved:${resolvedPageUrl}`);
-    if (cached && Date.now() - cached.time < RESOLVE_TTL) return cached.value;
-    const sources = await browserResolve(resolvedPageUrl);
+    const resolvedCacheKey = `resolved:${resolvedPageUrl}`;
+    const cached = cache.get(resolvedCacheKey);
+    if (cached && Date.now() - cached.time < RESOLVE_TTL) {
+      return { pageUrl: resolvedPageUrl, sources: mergeSources(directSources, cached.value?.sources) };
+    }
+    const browserSources = await browserResolve(resolvedPageUrl);
+    const sources = mergeSources(directSources, browserSources);
     const value = { pageUrl: resolvedPageUrl, sources };
-    if (sources.length) cache.set(`resolved:${resolvedPageUrl}`, { time: Date.now(), value });
-    if (sources.length) return value;
+    if (sources.length) cache.set(resolvedCacheKey, { time: Date.now(), value });
+    return value;
   } catch (e) {
     console.error('YanHH3D browser resolver failed:', e.message);
   }
-  return { pageUrl: resolvedPageUrl, sources: [] };
+  return { pageUrl: resolvedPageUrl, sources: directSources };
 }
