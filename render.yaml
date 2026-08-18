@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: yanhh3d-stremio-addon-v05
+    env: node
+    plan: free
+    buildCommand: npm ci && npx playwright install --with-deps chromium
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: RESOLVER_BROWSER
+        value: "1"
