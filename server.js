@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { Readable } from 'node:stream';
 import stremioAddonSdk from 'stremio-addon-sdk';
 const { addonBuilder, getRouter } = stremioAddonSdk;
 import { scrapeCatalog, scrapeMeta, resolveEpisode } from './yanhh3d.js';
@@ -11,6 +12,25 @@ const BROWSER_ENABLED = process.env.RESOLVER_BROWSER !== '0';
 const BASES = (process.env.YANHH3D_BASES || process.env.YANHH3D_BASE ||
   'https://yanhh3d.co,https://yanhh3d.dev,https://yanhh3d.ac,https://yanhh3d.pw,https://yanhh3d.love,https://yanhh3d.id,https://yanhh3d.net,https://yanhh3d.sh,https://yanhh3d.to,https://yanhh3d.cv')
   .split(',').map(x => x.trim().replace(/\/$/, '')).filter(Boolean);
+const PUBLIC_URL = String(process.env.PUBLIC_URL || '').trim().replace(/\/$/, '');
+const PROXY_STREAMS = process.env.PROXY_STREAMS !== '0';
+const ALLOWED_PROXY_HOSTS = new Set(
+  String(process.env.ALLOWED_PROXY_HOSTS || 'yanhh3d.co,yanhh3d.dev,yanhh3d.ac,yanhh3d.pw,yanhh3d.love,yanhh3d.id,yanhh3d.net,yanhh3d.sh,yanhh3d.to,yanhh3d.cv,kkphimplayer6.com,fbcdn.cloud')
+    .split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
+);
+
+function isAllowedProxyHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return [...ALLOWED_PROXY_HOSTS].some(allowed => host === allowed || host.endsWith(`.${allowed}`) || (allowed === 'fbcdn.cloud' && host.endsWith('.fbcdn.cloud')));
+}
+
+function proxyUrl(sourceUrl, headers = {}) {
+  if (!PUBLIC_URL || !PROXY_STREAMS) return sourceUrl;
+  const query = new URLSearchParams({ url: sourceUrl });
+  if (headers.Referer) query.set('referer', headers.Referer);
+  if (headers.Origin) query.set('origin', headers.Origin);
+  return `${PUBLIC_URL}/proxy?${query.toString()}`;
+}
 
 const manifest = {
   id: 'community.yanhh3d',
@@ -68,7 +88,7 @@ builder.defineStreamHandler(async ({ id }) => {
     return {
       name: s.quality ? `YanHH3D ${s.quality}` : `YanHH3D Server ${i + 1}`,
       title: s.type === 'hls' ? 'Native HLS' : s.type === 'mp4' ? 'Native MP4' : 'Video source',
-      url: s.url,
+      url: proxyUrl(s.url, s.headers),
       behaviorHints
     };
   });
@@ -83,7 +103,57 @@ builder.defineStreamHandler(async ({ id }) => {
   return { streams };
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, bases: BASES, browserResolver: BROWSER_ENABLED }));
+app.get('/health', (_req, res) => res.json({ ok: true, bases: BASES, browserResolver: BROWSER_ENABLED, proxyStreams: PROXY_STREAMS && Boolean(PUBLIC_URL) }));
+
+app.get('/proxy', async (req, res) => {
+  try {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url : '';
+    const target = new URL(rawUrl);
+    if (target.protocol !== 'https:' || !isAllowedProxyHost(target.hostname)) {
+      return res.status(403).json({ error: 'proxy host is not allowed' });
+    }
+
+    const referer = typeof req.query.referer === 'string' ? req.query.referer : `${target.origin}/`;
+    const origin = typeof req.query.origin === 'string' ? req.query.origin : '';
+    const upstreamHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+      Referer: referer
+    };
+    if (origin) upstreamHeaders.Origin = origin;
+    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
+
+    const upstream = await fetch(target.href, { headers: upstreamHeaders, redirect: 'follow' });
+    const contentType = upstream.headers.get('content-type') || '';
+    const isPlaylist = /\.m3u8(?:$|[?#])|mpegurl/i.test(target.pathname + target.search + contentType);
+    res.status(upstream.status);
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'no-store');
+    if (!isPlaylist && contentType) res.set('Content-Type', contentType);
+
+    if (isPlaylist) {
+      const playlist = await upstream.text();
+      const baseUrl = upstream.url || target.href;
+      const rewritten = playlist.split(/\r?\n/).map(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return line;
+        try {
+          const child = new URL(trimmed, baseUrl);
+          if (child.protocol !== 'https:' || !isAllowedProxyHost(child.hostname)) return line;
+          return proxyUrl(child.href, { Referer: baseUrl, Origin: new URL(baseUrl).origin });
+        } catch {
+          return line;
+        }
+      }).join('\n');
+      res.set('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+      return res.send(rewritten);
+    }
+
+    if (!upstream.body) return res.end();
+    return Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || 'proxy request failed' });
+  }
+});
 app.get('/debug/resolve/:slug/:episode', async (req, res) => {
   try {
     const episode = Number(req.params.episode);
